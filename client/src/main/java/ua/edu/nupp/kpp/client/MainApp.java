@@ -7,6 +7,7 @@ import javafx.application.Platform;
 import javafx.beans.property.SimpleStringProperty;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
+import javafx.concurrent.Task;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Scene;
@@ -18,12 +19,21 @@ import javafx.util.StringConverter;
 import ua.edu.nupp.kpp.client.http.ApiClient;
 
 import java.io.File;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.time.LocalDate;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 public class MainApp extends Application {
+
+    private static final Logger LOGGER =
+            Logger.getLogger(MainApp.class.getName());
 
     private final ApiClient api = new ApiClient();
 
@@ -51,7 +61,6 @@ public class MainApp extends Application {
         header.getStyleClass().add("app-header");
 
         TabPane tabs = new TabPane();
-
         tabs.setTabClosingPolicy(
                 TabPane.TabClosingPolicy.UNAVAILABLE
         );
@@ -144,24 +153,25 @@ public class MainApp extends Application {
         Label statusLabel = new Label("Готово");
         statusLabel.getStyleClass().add("status-label");
 
+        ProgressBar progressBar = new ProgressBar(0);
+        progressBar.setPrefWidth(180);
+        progressBar.setVisible(false);
+        progressBar.setManaged(false);
+
         Button add = new Button("＋ Додати");
         Button edit = new Button("✎ Редагувати");
         Button delete = new Button("Видалити");
         Button refreshButton = new Button("⟳ Оновити");
-
         Button indicatorButton =
                 new Button("Розрахувати показник");
-
         Button importButton =
                 new Button("Імпорт CSV");
 
         add.getStyleClass().add("primary-button");
         delete.getStyleClass().add("danger-button");
-
         indicatorButton.getStyleClass().add("indicator-button");
         importButton.getStyleClass().add("indicator-button");
 
-        // Завантаження даних з сервера
         Runnable refresh = () -> {
 
             statusLabel.setText("Завантаження...");
@@ -201,15 +211,17 @@ public class MainApp extends Application {
 
                     Platform.runLater(() -> {
                         rows.setAll(loaded);
-
                         countLabel.setText(
                                 "Записів: " + loaded.size()
                         );
-
                         statusLabel.setText("Дані оновлено");
                     });
 
                 } catch (Exception ex) {
+                    LOGGER.log(Level.WARNING,
+                            "Помилка оновлення таблиці " + endpoint,
+                            ex);
+
                     Platform.runLater(() -> {
                         statusLabel.setText("Помилка підключення");
                         showError(ex.getMessage());
@@ -221,7 +233,6 @@ public class MainApp extends Application {
             worker.start();
         };
 
-        // CREATE
         add.setOnAction(e -> {
 
             Map<String, String> data =
@@ -238,7 +249,6 @@ public class MainApp extends Application {
             }
         });
 
-        // UPDATE
         edit.setOnAction(e -> {
 
             Map<String, String> selected =
@@ -260,12 +270,10 @@ public class MainApp extends Application {
             if (data != null) {
                 data.put("action", "update");
                 data.put("id", selected.get("id"));
-
                 send(endpoint, data, refresh, statusLabel);
             }
         });
 
-        // DELETE
         delete.setOnAction(e -> {
 
             Map<String, String> selected =
@@ -302,15 +310,11 @@ public class MainApp extends Application {
                 showIndicatorDialog()
         );
 
-        // CSV-імпорт для кожної вкладки
+        // Фоновий імпорт CSV через JavaFX Task
         importButton.setOnAction(e -> {
 
             FileChooser chooser = new FileChooser();
-
-            chooser.setTitle(
-                    "Виберіть CSV-файл: " + name
-            );
-
+            chooser.setTitle("Виберіть CSV-файл: " + name);
             chooser.getExtensionFilters().add(
                     new FileChooser.ExtensionFilter(
                             "CSV-файли (*.csv)", "*.csv"
@@ -325,46 +329,14 @@ public class MainApp extends Application {
                 return;
             }
 
-            // Перевірка заголовка перед імпортом
-            String expectedHeader = expectedCsvHeader(endpoint);
-
-            try {
-                String header = java.nio.file.Files.readAllLines(
-                        file.toPath(),
-                        java.nio.charset.StandardCharsets.UTF_8
-                ).stream().findFirst().orElse("");
-
-                header = header.replace("\uFEFF", "").trim();
-
-                if (!header.equals(expectedHeader)) {
-                    showError(
-                            "Цей CSV-файл не відповідає вкладці \""
-                                    + name + "\".\n\n"
-                                    + "Очікуваний заголовок:\n"
-                                    + expectedHeader
-                    );
-                    return;
-                }
-
-            } catch (Exception ex) {
-                showError(
-                        "Не вдалося прочитати CSV-файл: "
-                                + ex.getMessage()
-                );
-                return;
-            }
-
             Alert confirm =
                     new Alert(Alert.AlertType.CONFIRMATION);
 
             confirm.setTitle("Імпорт CSV");
             confirm.setHeaderText("Імпортувати файл?");
-
             confirm.setContentText(
                     "Файл: " + file.getName()
-                            + "\nВкладка: " + name
-                            + "\n\nЗаписи будуть додані до бази даних."
-                            + "\nПовторний імпорт може створити дублікати."
+                            + "\n\nПовторний імпорт може створити дублікати."
             );
 
             if (confirm.showAndWait().orElse(ButtonType.CANCEL)
@@ -372,55 +344,203 @@ public class MainApp extends Application {
                 return;
             }
 
-            statusLabel.setText("Імпорт CSV...");
+            Task<Integer> task = new Task<>() {
 
-            Thread worker = new Thread(() -> {
+                @Override
+                protected Integer call() throws Exception {
 
-                try {
-                    JsonNode result = api.importCsv(file);
+                    LOGGER.info(
+                            "Початок CSV-імпорту: " + file.getName()
+                    );
 
-                    if (!result.path("success").asBoolean(false)
-                            || !result.path("imported").isInt()) {
-                        throw new IllegalStateException(
-                                "Некоректна відповідь сервера"
+                    updateMessage("Читання CSV-файлу...");
+                    updateProgress(0, 1);
+
+                    List<String> lines = Files.readAllLines(
+                            file.toPath(),
+                            StandardCharsets.UTF_8
+                    );
+
+                    if (lines.isEmpty()) {
+                        throw new IllegalArgumentException(
+                                "CSV-файл порожній"
                         );
                     }
 
-                    int imported = result.path("imported").asInt();
+                    String header = lines.get(0)
+                            .replace("\uFEFF", "")
+                            .trim();
 
-                    Platform.runLater(() -> {
+                    String expectedHeader =
+                            expectedCsvHeader(endpoint);
 
-                        refresh.run();
+                    if (!header.equals(expectedHeader)) {
+                        throw new IllegalArgumentException(
+                                "Неправильний заголовок CSV.\n"
+                                        + "Очікується: " + expectedHeader
+                        );
+                    }
 
-                        Alert alert = new Alert(
-                                Alert.AlertType.INFORMATION
+                    List<String> dataLines = new ArrayList<>();
+
+                    for (int i = 1; i < lines.size(); i++) {
+
+                        String line = lines.get(i);
+
+                        if (line.isBlank()) {
+                            LOGGER.info(
+                                    "Пропущено порожній рядок: " + (i + 1)
+                            );
+                            continue;
+                        }
+
+                        int expectedColumns =
+                                header.split(";", -1).length;
+
+                        int actualColumns =
+                                line.split(";", -1).length;
+
+                        if (actualColumns != expectedColumns) {
+                            throw new IllegalArgumentException(
+                                    "Рядок " + (i + 1)
+                                            + ": неправильна кількість полів"
+                            );
+                        }
+
+                        dataLines.add(line);
+                    }
+
+                    if (dataLines.isEmpty()) {
+                        throw new IllegalArgumentException(
+                                "CSV не містить записів для імпорту"
+                        );
+                    }
+
+                    int imported = 0;
+                    int total = dataLines.size();
+
+                    for (int i = 0; i < total; i++) {
+
+                        if (isCancelled()) {
+                            break;
+                        }
+
+                        String line = dataLines.get(i);
+
+                        updateMessage(
+                                "Імпорт: " + (i + 1) + " / " + total
                         );
 
-                        alert.setTitle("Імпорт завершено");
-                        alert.setHeaderText(
-                                "CSV-файл успішно імпортовано"
+                        JsonNode result =
+                                api.importCsvRow(header, line);
+
+                        if (!result.path("success").asBoolean(false)
+                                || result.path("imported").asInt() != 1) {
+
+                            throw new IllegalStateException(
+                                    "Сервер не підтвердив імпорт рядка "
+                                            + (i + 1)
+                            );
+                        }
+
+                        imported++;
+                        updateProgress(imported, total);
+
+                        LOGGER.info(
+                                "Успішно імпортовано запис: "
+                                        + imported + "/" + total
                         );
+                    }
 
-                        alert.setContentText(
-                                "Додано записів: " + imported
-                        );
+                    LOGGER.info(
+                            "CSV-імпорт завершено. Додано: " + imported
+                    );
 
-                        alert.showAndWait();
-                    });
-
-                } catch (Exception ex) {
-                    Platform.runLater(() -> {
-                        statusLabel.setText("Помилка імпорту");
-                        showError(ex.getMessage());
-                    });
+                    return imported;
                 }
+            };
+
+            progressBar.progressProperty().unbind();
+            statusLabel.textProperty().unbind();
+
+            progressBar.progressProperty().bind(
+                    task.progressProperty()
+            );
+
+            statusLabel.textProperty().bind(
+                    task.messageProperty()
+            );
+
+            progressBar.setVisible(true);
+            progressBar.setManaged(true);
+
+            importButton.setDisable(true);
+
+            task.setOnSucceeded(event -> {
+
+                progressBar.progressProperty().unbind();
+                statusLabel.textProperty().unbind();
+
+                progressBar.setVisible(false);
+                progressBar.setManaged(false);
+                importButton.setDisable(false);
+
+                int imported = task.getValue();
+
+                statusLabel.setText(
+                        "Імпорт завершено. Додано: " + imported
+                );
+
+                refresh.run();
+
+                Alert alert = new Alert(
+                        Alert.AlertType.INFORMATION
+                );
+
+                alert.setTitle("Імпорт завершено");
+                alert.setHeaderText(
+                        "CSV-файл успішно імпортовано"
+                );
+                alert.setContentText(
+                        "Додано записів: " + imported
+                );
+                alert.showAndWait();
             });
 
+            task.setOnFailed(event -> {
+
+                progressBar.progressProperty().unbind();
+                statusLabel.textProperty().unbind();
+
+                progressBar.setVisible(false);
+                progressBar.setManaged(false);
+                importButton.setDisable(false);
+
+                Throwable error = task.getException();
+
+                LOGGER.log(
+                        Level.SEVERE,
+                        "Помилка CSV-імпорту",
+                        error
+                );
+
+                statusLabel.setText("Помилка імпорту");
+
+                showError(
+                        error == null
+                                ? "Невідома помилка"
+                                : error.getMessage()
+                );
+
+                // Частина записів могла бути імпортована
+                refresh.run();
+            });
+
+            Thread worker = new Thread(task);
             worker.setDaemon(true);
             worker.start();
         });
 
-        // Панель кнопок
         HBox toolbar = new HBox(
                 10, add, edit, delete, refreshButton
         );
@@ -429,14 +549,13 @@ public class MainApp extends Application {
             toolbar.getChildren().add(indicatorButton);
         }
 
-        // Кнопка імпорту на всіх чотирьох вкладках
         toolbar.getChildren().add(importButton);
 
         toolbar.setAlignment(Pos.CENTER_LEFT);
         toolbar.getStyleClass().add("action-toolbar");
 
         HBox footer = new HBox(
-                20, countLabel, statusLabel
+                20, countLabel, statusLabel, progressBar
         );
 
         footer.setAlignment(Pos.CENTER_LEFT);
@@ -462,7 +581,6 @@ public class MainApp extends Application {
         return tab;
     }
 
-    // Очікувані заголовки CSV
     private String expectedCsvHeader(String endpoint) {
 
         return switch (endpoint) {
@@ -483,7 +601,6 @@ public class MainApp extends Application {
         };
     }
 
-    // Українські назви стовпців
     private String columnName(String field) {
 
         return switch (field) {
@@ -517,7 +634,6 @@ public class MainApp extends Application {
                 || field.equals("completionDate");
     }
 
-    // Форма додавання та редагування
     private Map<String, String> showForm(
             String title,
             String endpoint,
@@ -597,7 +713,6 @@ public class MainApp extends Application {
                                 LocalDate.parse(currentValue)
                         );
                     } catch (Exception ignored) {
-                        // Некоректна дата
                     }
                 }
 
@@ -689,7 +804,6 @@ public class MainApp extends Application {
         };
     }
 
-    // Відправлення POST-запитів
     private void send(
             String endpoint,
             Map<String, String> data,
@@ -732,7 +846,6 @@ public class MainApp extends Application {
         worker.start();
     }
 
-    // Розрахунок інтегрального показника
     private void showIndicatorDialog() {
 
         Dialog<ButtonType> dialog = new Dialog<>();
@@ -848,11 +961,9 @@ public class MainApp extends Application {
         worker.start();
     }
 
-    // Відображення помилок
     private void showError(String message) {
 
         Alert alert = new Alert(Alert.AlertType.ERROR);
-
         alert.setTitle("Помилка");
         alert.setHeaderText("Операцію не виконано");
         alert.setContentText(message);
